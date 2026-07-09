@@ -1273,6 +1273,41 @@ function toast(text) {
 }
 const netError = (m) => { const e = $('netErr'); e.textContent = m; e.classList.remove('hidden'); };
 
+// --------------------------------------------------------- rounds picker
+/*
+ * This used to be a range slider with a small grey label. On a dark background
+ * the track is nearly invisible and nobody noticed it existed, so every match
+ * silently ran the default 3 rounds. Now it is a stepper with quick presets.
+ */
+const ROUND_MIN = 1, ROUND_MAX = 20;
+const ROUND_PRESETS = [1, 3, 5, 10];
+
+function makeRoundsPicker(key, initial) {
+  const root = document.querySelector(`[data-rounds="${key}"]`);
+  const valEl = root.querySelector('[data-val]');
+  const chipsEl = root.querySelector('[data-chips]');
+  let value = initial;
+
+  chipsEl.innerHTML = ROUND_PRESETS.map((n) => `<button class="chip" data-n="${n}">${n}판</button>`).join('');
+
+  const paint = () => {
+    valEl.textContent = value;
+    chipsEl.querySelectorAll('.chip').forEach((c) => c.classList.toggle('on', +c.dataset.n === value));
+    root.querySelectorAll('.step').forEach((b) => {
+      const next = value + +b.dataset.delta;
+      b.disabled = next < ROUND_MIN || next > ROUND_MAX;
+    });
+  };
+
+  root.querySelectorAll('.step').forEach((b) =>
+    (b.onclick = () => { value = clamp(value + +b.dataset.delta, ROUND_MIN, ROUND_MAX); paint(); haptics.grab(); }));
+  chipsEl.querySelectorAll('.chip').forEach((c) =>
+    (c.onclick = () => { value = +c.dataset.n; paint(); haptics.grab(); }));
+
+  paint();
+  return { get: () => value };
+}
+
 // ------------------------------------------------------------ hot-seat UI
 let localPlayers = ['Player 1', 'Player 2'];
 
@@ -1308,21 +1343,21 @@ document.querySelectorAll('[data-home]').forEach((b) => (b.onclick = () => showS
 document.querySelectorAll('[data-leave]').forEach((b) => (b.onclick = () => leaveNet()));
 document.querySelectorAll('[data-exit]').forEach((b) => (b.onclick = () => (role === 'SOLO' ? showScreen('homeScreen') : leaveNet())));
 
-$('rounds').oninput = (e) => ($('roundsLabel').textContent = `게임 횟수: ${e.target.value}판`);
-$('netRounds').oninput = (e) => ($('netRoundsLabel').textContent = `게임 횟수: ${e.target.value}판`);
+const roundsLocal = makeRoundsPicker('local', 3);
+const roundsNet = makeRoundsPicker('net', 3);
 $('btnAddPlayer').onclick = () => { localPlayers.push(`Player ${localPlayers.length + 1}`); renderPlayers(); };
 
 $('btnStartLocal').onclick = () => {
   if (!validateSetup()) return;
   role = 'SOLO'; myIndex = 0;
-  newGame(localPlayers.map((n) => n.trim()), +$('rounds').value);
+  newGame(localPlayers.map((n) => n.trim()), roundsLocal.get());
   enterGame();
 };
 
 $('btnHost').onclick = () => {
   const n = $('nick').value.trim();
   if (!n) return netError('닉네임을 입력해주세요.');
-  net.host(n, +$('netRounds').value);
+  net.host(n, roundsNet.get());
 };
 $('btnJoin').onclick = () => {
   const n = $('nick').value.trim();

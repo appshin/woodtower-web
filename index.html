@@ -56,6 +56,26 @@
     background:rgba(51,37,26,.92); border-radius:16px; padding:18px;
     box-shadow:0 12px 40px rgba(0,0,0,.5);
   }
+
+  /* rounds picker */
+  .rounds-title { font-size:15px; font-weight:600; margin-bottom:12px; text-align:center; }
+  .stepper { display:flex; align-items:center; justify-content:center; gap:16px; }
+  .step {
+    width:56px; height:56px; padding:0; border-radius:16px; font-size:28px; line-height:1;
+    background:rgba(0,0,0,.32); color:var(--cream); border:1px solid rgba(244,231,211,.28);
+  }
+  .step:active { background:rgba(0,0,0,.5); }
+  .rounds-val {
+    font-size:36px; font-weight:800; color:var(--amber);
+    min-width:104px; text-align:center; line-height:1.1;
+  }
+  .rounds-val small { font-size:16px; font-weight:600; margin-left:3px; }
+  .chips { display:flex; gap:8px; justify-content:center; margin-top:14px; flex-wrap:wrap; }
+  .chip {
+    width:auto; padding:8px 15px; border-radius:999px; font-size:14px;
+    background:transparent; color:var(--cream); border:1px solid rgba(244,231,211,.3);
+  }
+  .chip.on { background:var(--amber); color:var(--walnut); border-color:transparent; font-weight:700; }
   .stack > * + * { margin-top:10px; }
 
   /* --- game --- */
@@ -133,11 +153,16 @@
   <!-- SETUP (hot-seat) -->
   <section id="setupScreen" class="screen">
     <div class="row"><button class="icon-btn btn-sm" data-home>✕</button><h2>게임 설정</h2></div>
-    <div style="margin-top:14px">
-      <label class="muted" id="roundsLabel">게임 횟수: 3판</label>
-      <input type="range" id="rounds" min="1" max="10" value="3">
+    <div class="card" style="margin-top:14px" data-rounds="local">
+      <div class="rounds-title">게임 횟수 — 몇 판 하시겠어요?</div>
+      <div class="stepper">
+        <button class="step" data-delta="-1">−</button>
+        <div class="rounds-val"><span data-val>3</span><small>판</small></div>
+        <button class="step" data-delta="1">+</button>
+      </div>
+      <div class="chips" data-chips></div>
     </div>
-    <p class="muted" id="playerCount" style="margin:10px 0 6px">플레이어 (2명)</p>
+    <p class="muted" id="playerCount" style="margin:14px 0 6px">플레이어 (2명)</p>
     <ul class="list" id="playerList" style="flex:1"></ul>
     <button class="btn-ghost" id="btnAddPlayer" style="margin-bottom:10px">+ 플레이어 추가</button>
     <p class="err hidden" id="setupErr">이름은 비어 있거나 중복될 수 없습니다.</p>
@@ -150,9 +175,14 @@
     <p class="muted" style="margin:10px 0">WebRTC로 기기끼리 직접 연결합니다. 같은 방에 있을 필요는 없지만, 인터넷은 필요합니다.</p>
     <div class="stack">
       <input type="text" id="nick" placeholder="내 닉네임" maxlength="12" autocomplete="off">
-      <div>
-        <label class="muted" id="netRoundsLabel">게임 횟수: 3판</label>
-        <input type="range" id="netRounds" min="1" max="10" value="3">
+      <div class="card" data-rounds="net">
+        <div class="rounds-title">게임 횟수 (방장만 설정)</div>
+        <div class="stepper">
+          <button class="step" data-delta="-1">−</button>
+          <div class="rounds-val"><span data-val>3</span><small>판</small></div>
+          <button class="step" data-delta="1">+</button>
+        </div>
+        <div class="chips" data-chips></div>
       </div>
       <button class="btn-primary" id="btnHost">방 만들기</button>
       <div class="row" style="gap:8px">
