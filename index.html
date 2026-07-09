@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#23180F">
+<title>WoodTower — 우드타워</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --walnut:#23180F; --walnut-soft:#33251A; --amber:#E0A458;
+    --cream:#F4E7D3; --danger:#E05A4F; --safe:#6FBF73;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; margin:0; overscroll-behavior:none; }
+  body {
+    background:var(--walnut); color:var(--cream);
+    font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;
+    display:flex; justify-content:center;
+    touch-action:manipulation;
+  }
+  #app {
+    position:relative; width:100%; max-width:520px; height:100dvh; overflow:hidden;
+    background:url(table_bg.jpg) center/cover no-repeat;
+  }
+  #app::before { content:""; position:absolute; inset:0; background:rgba(18,12,7,.62); }
+  .screen {
+    position:absolute; inset:0; display:none; flex-direction:column;
+    padding:max(16px, env(safe-area-inset-top)) 18px 18px;
+  }
+  .screen.on { display:flex; }
+
+  h1 { font-size:32px; letter-spacing:1px; margin:0 0 8px; text-align:center; }
+  h2 { font-size:20px; margin:0; }
+  .muted { opacity:.72; font-size:14px; line-height:1.5; }
+  .center { text-align:center; }
+  .spacer { flex:1; }
+  .row { display:flex; align-items:center; gap:8px; }
+
+  button {
+    font:inherit; border-radius:12px; border:1px solid transparent; cursor:pointer;
+    padding:14px 16px; width:100%;
+  }
+  .btn-primary { background:var(--amber); color:var(--walnut); font-weight:700; }
+  .btn-ghost { background:transparent; color:var(--cream); border-color:rgba(244,231,211,.35); }
+  .btn-sm { width:auto; padding:8px 12px; font-size:14px; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+
+  input[type=text] {
+    font:inherit; width:100%; padding:12px; border-radius:10px;
+    border:1px solid rgba(244,231,211,.3); background:rgba(0,0,0,.25); color:var(--cream);
+  }
+  input[type=range] { width:100%; accent-color:var(--amber); }
+
+  .card {
+    background:rgba(51,37,26,.92); border-radius:16px; padding:18px;
+    box-shadow:0 12px 40px rgba(0,0,0,.5);
+  }
+  .stack > * + * { margin-top:10px; }
+
+  /* --- game --- */
+  #gameScreen { padding:max(8px, env(safe-area-inset-top)) 10px 6px; }
+  #hud { display:flex; align-items:center; gap:6px; }
+  #hud .who { flex:1; min-width:0; }
+  #hud .who b { font-size:19px; display:block; }
+  .icon-btn {
+    width:40px; height:40px; padding:0; border-radius:10px;
+    background:rgba(0,0,0,.3); color:var(--cream); font-size:18px; line-height:1;
+  }
+  .icon-btn.off { opacity:.35; }
+  #meterWrap { padding:6px 6px 0; }
+  #meterBg { height:6px; border-radius:3px; background:rgba(255,255,255,.2); overflow:hidden; }
+  #meter { height:100%; width:100%; background:var(--safe); transition:width .25s, background .25s; }
+  #meterText { font-size:12px; opacity:.75; margin-top:3px; }
+  #canvasWrap { flex:1; position:relative; min-height:0; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }
+  #hint { text-align:center; font-size:13px; opacity:.75; padding:8px 4px; }
+
+  .overlay {
+    position:absolute; inset:0; background:rgba(18,12,7,.86);
+    display:flex; align-items:center; justify-content:center; padding:20px;
+  }
+  .overlay.hidden, .hidden { display:none !important; }
+
+  .banner {
+    position:absolute; top:96px; left:14px; right:14px;
+    background:rgba(51,37,26,.96); border-radius:12px; padding:10px 14px;
+    display:flex; align-items:center; gap:10px; font-size:14px;
+  }
+  .spin {
+    width:16px; height:16px; border-radius:50%; flex:none;
+    border:2px solid rgba(244,231,211,.25); border-top-color:var(--amber);
+    animation:spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  ul.list { list-style:none; margin:0; padding:0; overflow-y:auto; }
+  ul.list li {
+    display:flex; align-items:center; gap:10px; padding:11px 4px;
+    border-bottom:1px solid rgba(244,231,211,.12);
+  }
+  li .grow { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  li .rank { width:26px; font-weight:700; }
+  li input[type=text] { flex:1; padding:9px 10px; }
+  li .stat { font-size:13px; opacity:.75; }
+  li.offline .grow { opacity:.45; }
+  .peer { cursor:pointer; background:rgba(0,0,0,.22); border-radius:10px; margin-bottom:6px; padding:12px; border-bottom:0; }
+  .roomcode {
+    font-size:40px; font-weight:800; letter-spacing:8px; text-align:center;
+    color:var(--amber); padding:10px 0 4px;
+  }
+  .err { color:var(--danger); font-size:13px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- HOME -->
+  <section id="homeScreen" class="screen on">
+    <div class="spacer"></div>
+    <h1>우드타워</h1>
+    <p class="muted center">한 명씩 돌아가며 블록을 빼세요.<br>무너뜨리면 실패 1회!</p>
+    <div class="spacer"></div>
+    <div class="stack">
+      <button class="btn-primary" id="btnLocal">이 기기로 함께하기</button>
+      <button class="btn-ghost" id="btnOnline">다른 기기와 연결하기</button>
+      <button class="btn-ghost" id="btnRank">순위 보기</button>
+    </div>
+    <p class="muted center" style="margin-top:14px">웹 테스트판 · 물리와 규칙은 안드로이드판과 동일</p>
+  </section>
+
+  <!-- SETUP (hot-seat) -->
+  <section id="setupScreen" class="screen">
+    <div class="row"><button class="icon-btn btn-sm" data-home>✕</button><h2>게임 설정</h2></div>
+    <div style="margin-top:14px">
+      <label class="muted" id="roundsLabel">게임 횟수: 3판</label>
+      <input type="range" id="rounds" min="1" max="10" value="3">
+    </div>
+    <p class="muted" id="playerCount" style="margin:10px 0 6px">플레이어 (2명)</p>
+    <ul class="list" id="playerList" style="flex:1"></ul>
+    <button class="btn-ghost" id="btnAddPlayer" style="margin-bottom:10px">+ 플레이어 추가</button>
+    <p class="err hidden" id="setupErr">이름은 비어 있거나 중복될 수 없습니다.</p>
+    <button class="btn-primary" id="btnStartLocal">시작하기</button>
+  </section>
+
+  <!-- ONLINE ENTRY -->
+  <section id="onlineScreen" class="screen">
+    <div class="row"><button class="icon-btn btn-sm" data-home>✕</button><h2>다른 기기와 연결</h2></div>
+    <p class="muted" style="margin:10px 0">WebRTC로 기기끼리 직접 연결합니다. 같은 방에 있을 필요는 없지만, 인터넷은 필요합니다.</p>
+    <div class="stack">
+      <input type="text" id="nick" placeholder="내 닉네임" maxlength="12" autocomplete="off">
+      <div>
+        <label class="muted" id="netRoundsLabel">게임 횟수: 3판</label>
+        <input type="range" id="netRounds" min="1" max="10" value="3">
+      </div>
+      <button class="btn-primary" id="btnHost">방 만들기</button>
+      <div class="row" style="gap:8px">
+        <input type="text" id="joinCode" placeholder="방 코드 4자리" maxlength="4" autocomplete="off"
+               style="text-transform:uppercase">
+        <button class="btn-ghost btn-sm" id="btnJoin" style="white-space:nowrap">참가</button>
+      </div>
+      <p class="err hidden" id="netErr"></p>
+    </div>
+    <div class="spacer"></div>
+    <p class="muted">방장이 설정한 횟수로 진행됩니다. 방장이 나가면 게임이 종료됩니다.</p>
+  </section>
+
+  <!-- LOBBY -->
+  <section id="lobbyScreen" class="screen">
+    <div class="row"><button class="icon-btn btn-sm" data-leave>✕</button><h2 id="lobbyTitle">대기실</h2></div>
+    <div id="roomCodeWrap" class="hidden">
+      <p class="muted center" style="margin:16px 0 0">친구에게 이 코드를 알려주세요</p>
+      <div class="roomcode" id="roomCode">----</div>
+    </div>
+    <p class="muted" id="lobbyHint" style="margin:12px 0"></p>
+    <ul class="list" id="lobbyList" style="flex:1"></ul>
+    <button class="btn-primary hidden" id="btnStartNet" disabled>게임 시작</button>
+    <p class="muted center hidden" id="lobbyWait">방장이 시작하기를 기다리는 중…</p>
+  </section>
+
+  <!-- GAME -->
+  <section id="gameScreen" class="screen">
+    <div id="hud">
+      <button class="icon-btn" data-exit>←</button>
+      <div class="who">
+        <b id="turnName">—</b>
+        <span class="muted" id="roundText">1 / 3 라운드</span>
+      </div>
+      <button class="icon-btn" id="btnSound">🔊</button>
+      <button class="icon-btn" id="btnHaptic">📳</button>
+      <button class="icon-btn" id="btnRotate">↻</button>
+    </div>
+    <div id="meterWrap">
+      <div id="meterBg"><div id="meter"></div></div>
+      <div id="meterText">안정도 100%</div>
+    </div>
+    <div id="canvasWrap"><canvas id="tower"></canvas></div>
+    <div id="hint">블록을 아래로 끌어당겨 빼세요 · 현재 시점: 정면</div>
+
+    <div class="banner hidden" id="waitBanner">
+      <div class="spin"></div>
+      <span class="grow" id="waitText"></span>
+      <button class="btn-ghost btn-sm hidden" id="btnSkip">건너뛰기</button>
+    </div>
+
+    <div class="overlay hidden" id="reconnectOverlay">
+      <div class="center stack">
+        <div class="spin" style="margin:0 auto 14px; width:28px; height:28px"></div>
+        <h2>재접속 중…</h2>
+        <p class="muted">방장을 다시 찾고 있습니다.<br>자리와 점수는 그대로 유지됩니다.</p>
+        <button class="btn-ghost" data-leave>게임 나가기</button>
+      </div>
+    </div>
+
+    <div class="overlay hidden" id="resultOverlay">
+      <div class="card" style="width:100%">
+        <h2 id="resultTitle">라운드 종료</h2>
+        <p id="resultWho" style="color:var(--danger); margin:6px 0 14px"></p>
+        <ul class="list" id="standings"></ul>
+        <div class="stack" style="margin-top:16px">
+          <button class="btn-primary hidden" id="btnNextRound">다음 라운드</button>
+          <button class="btn-primary hidden" id="btnSeeRank">순위 보기</button>
+          <button class="btn-ghost hidden" id="btnResultHome">홈으로</button>
+          <p class="muted center hidden" id="waitHostText">방장이 다음 라운드를 시작할 때까지 기다려주세요.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RANKING -->
+  <section id="rankScreen" class="screen">
+    <div class="row"><button class="icon-btn btn-sm" data-home>←</button><h2>순위</h2></div>
+    <div style="flex:1; overflow-y:auto; margin-top:12px">
+      <p class="muted hidden" id="sessionLabel">이번 게임</p>
+      <ul class="list" id="sessionRank"></ul>
+      <p class="muted" style="margin-top:18px">누적 기록</p>
+      <ul class="list" id="lifetimeRank"></ul>
+      <p class="muted hidden" id="rankEmpty">기록이 아직 없습니다.</p>
+    </div>
+    <button class="btn-ghost" id="btnClearRank" style="margin-top:10px">누적 기록 삭제</button>
+  </section>
+
+</div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
