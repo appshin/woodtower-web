@@ -350,7 +350,10 @@ const isOnline = (i) => (S.online ? S.online[i] !== false : true);
 const isMyTurn = () => (role === 'SOLO' ? true : S && S.current === myIndex && !reconnecting);
 const canControlFlow = () => role !== 'GUEST';
 
+function clearSelection() { selected = null; pulling = false; pullDist = 0; }
+
 function newGame(players, rounds) {
+  clearSelection();
   S = {
     players, online: players.map(() => true),
     totalRounds: rounds, round: 1, current: 0,
@@ -394,7 +397,11 @@ function applyPull(block, jerk) {
 
 function pull(block, jerk) {
   if (!isMyTurn() || S.phase !== 'PLAYING' || !canRemove(S.tower, block)) return;
-  if (role === 'GUEST') { net.send({ t: 'PULL', id: block.id, j: jerk }); return; }
+  if (role === 'GUEST') {
+    // The host is the only authority; we just ask.
+    if (net.hostConn && net.hostConn.open) net.hostConn.send({ t: 'PULL', id: block.id, j: jerk });
+    return;
+  }
   applyPull(block, jerk);
   if (role === 'HOST') net.broadcast(stateMsg());
   layout();
@@ -421,6 +428,7 @@ function nextRound() {
     waitingFor: -1, waitSeconds: 0,
   });
   resetView();
+  clearSelection();
   if (role === 'HOST') net.broadcast(stateMsg());
   $('resultOverlay').classList.add('hidden');
   layout();          // the fresh tower is shorter, so the camera scale changes
@@ -552,9 +560,11 @@ const LIGHT = (() => { const l = { x: -0.42, y: 0.80, z: 0.43 };
   const m = Math.hypot(l.x, l.y, l.z); return { x: l.x / m, y: l.y / m, z: l.z / m }; })();
 
 // ---------------------------------------------------------------- the frame
-let frame = [];          // per-block picking data, nearest last
+let frame = [];          // one entry per block, with its visible faces
+let pickFaces = [];      // every visible face, nearest LAST — the painter's order
 let debris = null, collapseStart = 0;
-let selected = null, pullDist = 0, jerk = 0, curTight = 0.5;
+let selected = null;     // the block the player has tapped, highlighted
+let pulling = false, pullDist = 0, jerk = 0, curTight = 0.5;
 let pullOutDir = null;   // world unit vector the selected block slides along
 let pullScreen = null;   // that direction, projected, in px per world unit
 
@@ -587,7 +597,10 @@ const pullLimitWorld = () => BLOCK_LEN * 0.62;
 
 function buildFrame() {
   const lean = leanAngles();
+  // A block that no longer exists cannot stay selected.
+  if (selected && !S.tower.blocks.some((b) => b.id === selected.id)) selected = null;
   frame = [];
+  pickFaces = [];
   const quads = [];
 
   for (const b of S.tower.blocks) {
@@ -599,13 +612,14 @@ function buildFrame() {
       const d = debris.get(b.id);
       if (!d) continue;
       cx += d.dx; cy += d.dy; cz += d.dz; spin = d;
-    } else if (selected && selected.id === b.id && pullDist > 0) {
+    } else if (pulling && selected && selected.id === b.id && pullDist > 0) {
       cx += pullOutDir.x * pullDist; cy += pullOutDir.y * pullDist; cz += pullOutDir.z * pullDist;
     }
 
     const isSel = selected && selected.id === b.id;
     const forb = !debris && forbiddenLevels(S.tower).has(b.level);
     const polys = [];
+    const faceDepths = [];
 
     for (const f of facesOf(g)) {
       let n = f.n;
@@ -625,6 +639,7 @@ function buildFrame() {
       const depth = (pts[0].d + pts[1].d + pts[2].d) / 3;
       const poly = [pts[0], pts[1], p4, pts[2]];
       polys.push(poly);
+      faceDepths.push(depth);
       quads.push({ depth, pts, img: f.img, shade, isSel, forb });
     }
     if (!polys.length) continue;
@@ -639,13 +654,19 @@ function buildFrame() {
 
     const o = project({ x: cx, y: cy, z: cz }, lean);
     const o2 = project({ x: cx + outDir.x, y: cy, z: cz + outDir.z }, lean);
-    frame.push({
-      block: b, polys, forb, depth: o.d, reach, outDir,
+    const entry = {
+      block: b, polys, forb, reach, outDir, isSel,
       outScreen: { x: o2.x - o.x, y: o2.y - o.y },
-    });
+    };
+    frame.push(entry);
+    // Hit-test against individual faces at their own depth. Sorting whole
+    // blocks by their centre gets this wrong: a long block reaching toward the
+    // camera has a far-away centre but a very near front face.
+    polys.forEach((poly, k) => pickFaces.push({ entry, poly, depth: faceDepths[k] }));
   }
 
   quads.sort((a, b) => a.depth - b.depth);
+  pickFaces.sort((a, b) => a.depth - b.depth);
   return quads;
 }
 
@@ -669,7 +690,7 @@ function drawQuad(q) {
   const dark = 1 - q.shade;
   if (dark > 0.001) { ctx2d.fillStyle = `rgba(24,14,6,${dark.toFixed(3)})`; ctx2d.fillRect(0, 0, w, h); }
   if (q.forb) { ctx2d.fillStyle = 'rgba(60,26,12,.34)'; ctx2d.fillRect(0, 0, w, h); }
-  if (q.isSel) { ctx2d.fillStyle = 'rgba(255,214,140,.30)'; ctx2d.fillRect(0, 0, w, h); }
+  if (q.isSel) { ctx2d.fillStyle = 'rgba(255,196,92,.42)'; ctx2d.fillRect(0, 0, w, h); }
   ctx2d.restore();
 }
 
@@ -678,12 +699,28 @@ function render() {
   const W = canvas.clientWidth, H = canvas.clientHeight;
   ctx2d.clearRect(0, 0, W, H);
   const quads = buildFrame();
-  frame.sort((a, b) => a.depth - b.depth);   // picking wants nearest last
   for (const q of quads) drawQuad(q);
+
+  // Outline the chosen block so there is never any doubt about what will move.
+  const sel = frame.find((f) => f.isSel);
+  if (sel && !debris) {
+    const reachable = !sel.forb && sel.reach >= REACH_MIN;
+    ctx2d.lineWidth = 2.4;
+    ctx2d.strokeStyle = reachable ? 'rgba(255,203,112,.95)' : 'rgba(224,90,79,.9)';
+    ctx2d.lineJoin = 'round';
+    for (const poly of sel.polys) {
+      ctx2d.beginPath();
+      ctx2d.moveTo(poly[0].x, poly[0].y);
+      for (let i = 1; i < poly.length; i++) ctx2d.lineTo(poly[i].x, poly[i].y);
+      ctx2d.closePath();
+      ctx2d.stroke();
+    }
+  }
 }
 
 // -------------------------------------------------------------- collapse
 function startCollapse() {
+  clearSelection();
   const rnd = mulberry32(S.seed);
   debris = new Map();
   for (const b of S.tower.blocks) {
@@ -736,12 +773,20 @@ requestAnimationFrame(loop);
 
 // ------------------------------------------------------------------- input
 /*
- * One finger does two jobs, so we watch the first few pixels to decide:
- * a mostly-horizontal move orbits the camera, anything else on a reachable
- * block pulls it. Starting on empty space always orbits.
+ * Two clean, non-overlapping gestures:
+ *
+ *   tap  -> choose a block (it lights up)
+ *   drag -> starting on the chosen block, pull it out; anywhere else, orbit
+ *
+ * The earlier build guessed intent from the first few pixels of a drag, so a
+ * finger that grazed a block on its way to rotating the tower would yank it.
+ * Selecting first removes the guess entirely.
  */
-const GESTURE_SLOP = 9;
-let ptr = null;   // {id, x0, y0, lastX, lastY, mode, hit}
+const TAP_SLOP = 12;     // px of travel still counted as a tap
+const TAP_MS = 500;      // and it has to be quick
+const REACH_MIN = 0.26;  // how square-on a block's axis must face the camera
+
+let ptr = null;
 
 function canvasPoint(e) {
   const r = canvas.getBoundingClientRect();
@@ -758,16 +803,16 @@ function pointInPoly(pt, poly) {
   return inside;
 }
 
-/** Nearest block whose visible silhouette contains the point. */
+/** The face nearest the camera under the finger, and the block it belongs to. */
 function pick(pt) {
-  for (let i = frame.length - 1; i >= 0; i--) {
-    const f = frame[i];
-    if (f.polys.some((p) => pointInPoly(pt, p))) return f;
+  for (let i = pickFaces.length - 1; i >= 0; i--) {
+    if (pointInPoly(pt, pickFaces[i].poly)) return pickFaces[i].entry;
   }
   return null;
 }
 
 const inputEnabled = () => S && S.phase === 'PLAYING' && isMyTurn() && S.waitingFor < 0 && !debris;
+const grabbable = (f) => f && !f.forb && f.reach >= REACH_MIN;
 
 /** Screen direction the block travels as it comes out, and px per world unit. */
 function pullVectors(f) {
@@ -777,15 +822,39 @@ function pullVectors(f) {
   return { unit: { x: f.outScreen.x / L, y: f.outScreen.y / L }, pxPerUnit: L };
 }
 
+function beginPull(f, ts) {
+  pulling = true;
+  pullOutDir = f.outDir;
+  pullScreen = pullVectors(f);
+  pullDist = 0; jerk = 0;
+  curTight = tightnessOf(S.tower, f.block);
+  feel.grab(curTight, slipLengthPx(curTight, BLOCK_H * scale), ts);
+}
+
+function handleTap(f) {
+  if (!inputEnabled()) return;
+  if (!f) { selected = null; syncHud(); return; }
+  if (f.forb) { toast('맨 위 층의 블록은 뺄 수 없습니다.'); return; }
+  selected = f.block;
+  if (f.reach < REACH_MIN) toast('화면을 돌려서 이 블록의 끝면이 보이게 하세요.');
+  else haptics.grab();
+  syncHud();
+}
+
 canvas.addEventListener('pointerdown', (e) => {
   sound.unlock();
   if (ptr) return;
   const p = canvasPoint(e);
   canvas.setPointerCapture(e.pointerId);
-  const hit = inputEnabled() ? pick(p) : null;
-  ptr = { id: e.pointerId, x0: p.x, y0: p.y, lastX: p.x, lastY: p.y, ts: e.timeStamp, mode: null, hit };
-  // Nothing grabbable under the finger, or the block is out of reach: orbit.
-  if (!hit || hit.forb || hit.reach < 0.26) ptr.mode = 'orbit';
+  const f = pick(p);
+  ptr = { id: e.pointerId, x0: p.x, y0: p.y, lastX: p.x, lastY: p.y,
+          t0: e.timeStamp, ts: e.timeStamp, moved: 0, hit: f, mode: 'orbit' };
+
+  // Only the block you already chose responds to a drag. Everything else orbits.
+  if (inputEnabled() && f && selected && f.block.id === selected.id && grabbable(f)) {
+    ptr.mode = 'pull';
+    beginPull(f, e.timeStamp);
+  }
   yawVel = 0;
 });
 
@@ -794,49 +863,44 @@ canvas.addEventListener('pointermove', (e) => {
   const p = canvasPoint(e);
   const dx = p.x - ptr.lastX, dy = p.y - ptr.lastY;
   ptr.lastX = p.x; ptr.lastY = p.y;
-
-  if (!ptr.mode) {
-    const tx = p.x - ptr.x0, ty = p.y - ptr.y0;
-    if (Math.hypot(tx, ty) < GESTURE_SLOP) return;
-    if (Math.abs(tx) > Math.abs(ty) * 1.15) { ptr.mode = 'orbit'; }
-    else {
-      ptr.mode = 'pull';
-      selected = ptr.hit.block;
-      pullOutDir = ptr.hit.outDir;
-      pullScreen = pullVectors(ptr.hit);
-      pullDist = 0; jerk = 0;
-      curTight = tightnessOf(S.tower, selected);
-      feel.grab(curTight, slipLengthPx(curTight, BLOCK_H * scale), e.timeStamp);
-    }
-  }
-
-  if (ptr.mode === 'orbit') {
-    yaw += dx * 0.0072;
-    pitch = clamp(pitch - dy * 0.0045, PITCH_MIN, PITCH_MAX);
-    const dt = Math.max(0.008, (e.timeStamp - ptr.ts) / 1000);
-    yawVel = clamp((dx * 0.0072) / dt, -7, 7);
-    ptr.ts = e.timeStamp;
-    return;
-  }
+  ptr.moved = Math.max(ptr.moved, Math.hypot(p.x - ptr.x0, p.y - ptr.y0));
 
   if (ptr.mode === 'pull') {
     const along = (dx * pullScreen.unit.x + dy * pullScreen.unit.y) / pullScreen.pxPerUnit;
     const before = pullDist;
     pullDist = Math.max(0, pullDist + along);
-    jerk = Math.max(jerk, clamp(Math.abs(along) * scale / 40, 0, 1));
+    jerk = Math.max(jerk, clamp((Math.abs(along) * scale) / 40, 0, 1));
     feel.slide((pullDist - before) * pullScreen.pxPerUnit, e.timeStamp);
+    return;
   }
+
+  yaw += dx * 0.0072;
+  pitch = clamp(pitch - dy * 0.0045, PITCH_MIN, PITCH_MAX);
+  const dt = Math.max(0.008, (e.timeStamp - ptr.ts) / 1000);
+  yawVel = clamp((dx * 0.0072) / dt, -7, 7);
+  ptr.ts = e.timeStamp;
 });
 
 function endPointer(e) {
   if (!ptr || (e && e.pointerId !== ptr.id)) return;
-  if (ptr.mode === 'pull' && selected) {
+  const held = e ? e.timeStamp - ptr.t0 : 999;
+
+  if (ptr.mode === 'pull') {
     const extracted = pullDist >= pullLimitWorld();
     feel.release(extracted);
     const b = selected;
-    selected = null; pullDist = 0;
-    if (extracted) { const before = S.pulls.reduce((a, c) => a + c, 0); pull(b, jerk); afterPull(before); }
+    pulling = false; pullDist = 0;
+    if (extracted) {
+      selected = null;
+      const before = S.pulls.reduce((a, c) => a + c, 0);
+      pull(b, jerk);
+      afterPull(before);
+    }
     jerk = 0;
+  } else if (ptr.moved < TAP_SLOP && held < TAP_MS) {
+    handleTap(ptr.hit);
+  } else {
+    yawVel = clamp(yawVel, -7, 7);
   }
   ptr = null;
 }
@@ -861,7 +925,8 @@ function syncHud() {
   $('meterText').textContent = `안정도 ${Math.round(m * 100)}%`;
   $('hint').textContent = !isMyTurn()
     ? `${S.players[S.current]} 님의 차례를 기다리는 중…`
-    : '좌우로 밀면 타워가 돌아갑니다 · 블록을 잡아 바깥으로 당겨 빼세요';
+    : (selected ? '선택한 블록을 잡고 바깥으로 당기세요 · 빈 곳을 밀면 회전'
+                : '블록을 탭해서 선택하세요 · 화면을 밀면 타워가 돌아갑니다');
 
   const wb = $('waitBanner');
   if (S.waitingFor >= 0) {
@@ -914,11 +979,20 @@ const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // no I/O/0/1
 const peerIdFor = (code) => 'woodtower-v1-' + code;
 
 const net = {
-  peer: null, conns: new Map(),   // host: pid -> DataConnection
+  peer: null,
   hostConn: null, hostCode: '',
   seats: [],                      // [{pid, name, conn, connected}]
   gameStarted: false, rounds: 3, myName: '',
   graceTimer: null, retryTimer: null,
+
+  /*
+   * PeerJS callbacks fire long after the fact. If the player backs out of the
+   * lobby, `peer` is destroyed and nulled, but a pending 'open' still arrives
+   * and happily calls this.peer.connect() on null. Every async entry point
+   * therefore captures the session generation and bails if it has moved on.
+   */
+  gen: 0,
+  stale(g) { return this.gen !== g; },
 
   available() {
     if (typeof Peer === 'undefined') { netError('PeerJS를 불러오지 못했습니다. 인터넷 연결을 확인해주세요.'); return false; }
@@ -928,18 +1002,21 @@ const net = {
   // ---- host ----------------------------------------------------------
   host(name, rounds) {
     if (!this.available()) return;
+    const g = ++this.gen;
     role = 'HOST'; myIndex = 0; this.myName = name; this.rounds = rounds;
     this.gameStarted = false;
     this.seats = [{ pid: myPid, name, conn: null, connected: true }];
-    this._openHostPeer(0);
+    this._openHostPeer(0, g);
   },
 
-  _openHostPeer(attempt) {
+  _openHostPeer(attempt, g) {
+    if (this.stale(g)) return;
     if (attempt > 6) { netError('방 코드를 만들지 못했습니다. 다시 시도해주세요.'); return; }
     const code = Array.from({ length: 4 }, () =>
       CODE_ALPHABET[(Math.random() * CODE_ALPHABET.length) | 0]).join('');
     const peer = new Peer(peerIdFor(code));
     peer.on('open', () => {
+      if (this.stale(g)) { try { peer.destroy(); } catch (e) {} return; }
       this.peer = peer; this.hostCode = code;
       $('roomCode').textContent = code;
       $('roomCodeWrap').classList.remove('hidden');
@@ -950,10 +1027,13 @@ const net = {
       showScreen('lobbyScreen');
       renderLobby();
     });
-    peer.on('connection', (conn) => this._onGuestConn(conn));
+    peer.on('connection', (conn) => { if (!this.stale(g)) this._onGuestConn(conn); });
     peer.on('error', (err) => {
-      if (err.type === 'unavailable-id') { peer.destroy(); this._openHostPeer(attempt + 1); }
-      else netError('연결 오류: ' + err.type);
+      if (this.stale(g)) return;
+      if (err.type === 'unavailable-id') {
+        try { peer.destroy(); } catch (e) {}
+        this._openHostPeer(attempt + 1, g);
+      } else netError('연결 오류: ' + err.type);
     });
   },
 
@@ -1051,31 +1131,44 @@ const net = {
     if (S) { S.waitingFor = -1; S.waitSeconds = 0; }
   },
 
-  broadcast(msg) { this.seats.forEach((s) => { if (s.conn && s.connected) try { s.conn.send(msg); } catch (e) {} }); },
+  broadcast(msg) {
+    this.seats.forEach((s) => {
+      if (s.conn && s.connected && s.conn.open) { try { s.conn.send(msg); } catch (e) {} }
+    });
+  },
 
   // ---- guest ---------------------------------------------------------
   join(name, code) {
     if (!this.available()) return;
+    const g = ++this.gen;
     role = 'GUEST'; this.myName = name; this.hostCode = code; this.gameStarted = false;
-    this.peer = new Peer();
-    this.peer.on('open', () => this._connectToHost());
-    this.peer.on('error', (err) => {
+    const peer = new Peer();
+    this.peer = peer;
+    peer.on('open', () => { if (!this.stale(g)) this._connectToHost(g); });
+    peer.on('error', (err) => {
+      if (this.stale(g)) return;
       if (err.type === 'peer-unavailable') {
-        if (reconnecting) return;                       // retry loop will keep trying
+        if (reconnecting) return;                       // the retry loop keeps trying
         netError('그 코드의 방을 찾을 수 없습니다.');
+        leaveNet();
+        showScreen('onlineScreen');
       } else netError('연결 오류: ' + err.type);
     });
   },
 
-  _connectToHost() {
+  _connectToHost(g) {
+    if (this.stale(g) || !this.peer || this.peer.destroyed) return;
     const conn = this.peer.connect(peerIdFor(this.hostCode), { reliable: true });
+    if (!conn) return;
     conn.on('open', () => {
+      if (this.stale(g)) { try { conn.close(); } catch (e) {} return; }
       this.hostConn = conn;
       if (this.retryTimer) { clearInterval(this.retryTimer); this.retryTimer = null; }
       conn.send({ t: 'HELLO', n: this.myName, pid: myPid });
     });
-    conn.on('data', (msg) => this._guestMessage(msg));
-    conn.on('close', () => this._guestLostHost());
+    conn.on('data', (msg) => { if (!this.stale(g)) this._guestMessage(msg); });
+    conn.on('close', () => { if (!this.stale(g)) this._guestLostHost(g); });
+    conn.on('error', () => { if (!this.stale(g)) this._guestLostHost(g); });
   },
 
   _guestMessage(msg) {
@@ -1108,20 +1201,29 @@ const net = {
     if (msg.t === 'ABORT') { toast('방장이 게임을 종료했습니다.'); leaveNet(); }
   },
 
-  _guestLostHost() {
+  _guestLostHost(g) {
+    if (role !== 'GUEST' || this.stale(g)) return;
     this.hostConn = null;
     if (!this.gameStarted) { toast('방장이 게임을 종료했습니다.'); leaveNet(); return; }
     // Keep the board on screen and go hunting for the host again.
     reconnecting = true;
     syncHud();
-    if (!this.retryTimer) this.retryTimer = setInterval(() => this._connectToHost(), 2500);
+    if (!this.retryTimer) {
+      this.retryTimer = setInterval(() => {
+        if (this.stale(g) || !this.peer || this.peer.destroyed) {
+          clearInterval(this.retryTimer); this.retryTimer = null; return;
+        }
+        this._connectToHost(g);
+      }, 2500);
+    }
   },
 
   shutdown() {
+    this.gen++;                       // invalidate every callback still in flight
     if (this.graceTimer) clearInterval(this.graceTimer);
     if (this.retryTimer) clearInterval(this.retryTimer);
     this.graceTimer = this.retryTimer = null;
-    if (role === 'HOST') this.broadcast({ t: 'ABORT' });
+    if (role === 'HOST') { try { this.broadcast({ t: 'ABORT' }); } catch (e) {} }
     try { this.peer && this.peer.destroy(); } catch (e) {}
     this.peer = null; this.hostConn = null; this.seats = []; this.gameStarted = false;
   },
@@ -1268,6 +1370,6 @@ window.addEventListener('beforeunload', () => net.shutdown());
  * A thrown error inside a click handler silently kills the button, which is how
  * "다음 라운드" ended up doing nothing. Surface it instead of swallowing it.
  */
-window.addEventListener('error', (e) => {
-  toast('오류: ' + (e.message || 'unknown'));
-});
+window.addEventListener('error', (e) => toast('오류: ' + (e.message || 'unknown')));
+window.addEventListener('unhandledrejection', (e) =>
+  toast('오류: ' + ((e.reason && e.reason.message) || e.reason || 'unknown')));
