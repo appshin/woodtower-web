@@ -320,11 +320,12 @@ const store = {
     return p;
   },
   stats() { try { return JSON.parse(localStorage.getItem('wt_stats') || '[]'); } catch (e) { return []; } },
-  merge(names, fails, pulls) {
+  /** @param rounds how many rounds this match actually played out. */
+  merge(names, fails, pulls, rounds) {
     const map = new Map(this.stats().map((r) => [r.n, r]));
     names.forEach((n, i) => {
-      const o = map.get(n) || { n, g: 0, f: 0, p: 0 };
-      map.set(n, { n, g: o.g + 1, f: o.f + fails[i], p: o.p + pulls[i] });
+      const o = map.get(n) || { n, g: 0, r: 0, f: 0, p: 0 };
+      map.set(n, { n, g: o.g + 1, r: (o.r || 0) + rounds, f: o.f + fails[i], p: o.p + pulls[i] });
     });
     localStorage.setItem('wt_stats', JSON.stringify([...map.values()]));
   },
@@ -359,6 +360,13 @@ function newGame(players, rounds) {
   };
   resetView();
 }
+
+/**
+ * Rounds that have been played to a conclusion. During ROUND_OVER/GAME_OVER the
+ * current round has just ended, so it counts; otherwise it is still in progress.
+ */
+const completedRounds = () =>
+  !S ? 0 : (S.phase === 'ROUND_OVER' || S.phase === 'GAME_OVER' ? S.round : S.round - 1);
 
 function nextOnlineAfter(from) {
   const n = S.players.length;
@@ -398,14 +406,14 @@ function onCollapseFinished() {
   if (role === 'GUEST' || S.phase !== 'COLLAPSING') return;
   const over = S.round >= S.totalRounds;
   S.phase = over ? 'GAME_OVER' : 'ROUND_OVER';
-  if (over) store.merge(S.players, S.fails, S.pulls);
+  if (over) store.merge(S.players, S.fails, S.pulls, S.round);
   if (role === 'HOST') net.broadcast(stateMsg());
   showResult();
 }
 
 function nextRound() {
   if (role === 'GUEST') return;
-  cancelGrace();
+  net.cancelGrace();
   const starter = S.loser >= 0 && isOnline(S.loser) ? S.loser : nextOnlineAfter(Math.max(0, S.loser));
   Object.assign(S, {
     round: S.round + 1, tower: freshTower(), current: starter, phase: 'PLAYING',
@@ -415,11 +423,25 @@ function nextRound() {
   resetView();
   if (role === 'HOST') net.broadcast(stateMsg());
   $('resultOverlay').classList.add('hidden');
+  layout();          // the fresh tower is shorter, so the camera scale changes
   render(); syncHud();
 }
 
+/** Same players, same round count, scores wiped. Host-or-solo only. */
+function restartGame() {
+  if (role === 'GUEST') return;
+  net.cancelGrace();
+  newGame(S.players, S.totalRounds);
+  if (role === 'HOST') { net.syncOnline(); net.broadcast(stateMsg()); }
+  $('resultOverlay').classList.add('hidden');
+  layout(); render(); syncHud();
+}
+
 function standings() {
-  const rows = S.players.map((n, i) => ({ n, f: S.fails[i], p: S.pulls[i], i }));
+  // Only the player who knocks the tower over loses that round; everyone else
+  // wins it. So wins are just the rounds finished minus your own collapses.
+  const done = completedRounds();
+  const rows = S.players.map((n, i) => ({ n, w: Math.max(0, done - S.fails[i]), f: S.fails[i], p: S.pulls[i], i }));
   rows.sort((a, b) => a.f - b.f || b.p - a.p);
   let rank = 0, prev = null;
   return rows.map((r, i) => {
@@ -861,12 +883,15 @@ function showResult() {
     <li class="${isOnline(r.i) ? '' : 'offline'}">
       <span class="rank">${r.rank}</span>
       <span class="grow">${escapeHtml(r.n)}${isOnline(r.i) ? '' : ' (접속 끊김)'}</span>
-      <span class="stat">실패 ${r.f} · 성공 ${r.p}</span>
+      <span class="stat"><b>${r.w}승 ${r.f}패</b><br>뽑기 ${r.p}</span>
     </li>`).join('');
   $('btnNextRound').classList.toggle('hidden', over || !canControlFlow());
   $('waitHostText').classList.toggle('hidden', over || canControlFlow());
   $('btnSeeRank').classList.toggle('hidden', !over);
-  $('btnResultHome').classList.toggle('hidden', !over);
+  $('btnRestart').classList.toggle('hidden', !over || !canControlFlow());
+  // An exit is always available, whatever the phase or role.
+  $('btnResultHome').classList.remove('hidden');
+  $('btnResultHome').textContent = role === 'SOLO' ? '홈으로' : '게임 나가기';
   $('resultOverlay').classList.remove('hidden');
 }
 
@@ -1212,6 +1237,7 @@ $('btnJoin').onclick = () => {
 $('btnStartNet').onclick = () => net.startNetGame();
 $('btnSkip').onclick = () => skipTurn();
 $('btnNextRound').onclick = () => nextRound();
+$('btnRestart').onclick = () => restartGame();
 $('btnSeeRank').onclick = () => { showRanking(); showScreen('rankScreen'); };
 $('btnResultHome').onclick = () => (role === 'SOLO' ? showScreen('homeScreen') : leaveNet());
 $('btnRotate').onclick = () => { resetView(); render(); };
@@ -1224,13 +1250,24 @@ function showRanking() {
   $('sessionLabel').classList.toggle('hidden', !hasSession);
   $('sessionRank').innerHTML = hasSession ? standings().map((r) => `
     <li><span class="rank">${r.rank}</span><span class="grow">${escapeHtml(r.n)}</span>
-    <span class="stat">실패 ${r.f} · 성공 ${r.p}</span></li>`).join('') : '';
+    <span class="stat"><b>${r.w}승 ${r.f}패</b><br>뽑기 ${r.p}</span></li>`).join('') : '';
 
-  const rows = store.stats().sort((a, b) => a.f - b.f || b.p - a.p);
+  // Records saved before wins existed have no `r`; show them as 0승 rather than lying.
+  const rows = store.stats()
+    .map((r) => ({ ...r, w: Math.max(0, (r.r || 0) - r.f) }))
+    .sort((a, b) => b.w - a.w || a.f - b.f || b.p - a.p);
   $('rankEmpty').classList.toggle('hidden', rows.length > 0);
   $('lifetimeRank').innerHTML = rows.map((r, i) => `
     <li><span class="rank">${i + 1}</span><span class="grow">${escapeHtml(r.n)}</span>
-    <span class="stat">${r.g}게임 · 실패 ${r.f} · 성공 ${r.p}</span></li>`).join('');
+    <span class="stat"><b>${r.w}승 ${r.f}패</b><br>${r.g}게임 · 뽑기 ${r.p}</span></li>`).join('');
 }
 
 window.addEventListener('beforeunload', () => net.shutdown());
+
+/*
+ * A thrown error inside a click handler silently kills the button, which is how
+ * "다음 라운드" ended up doing nothing. Surface it instead of swallowing it.
+ */
+window.addEventListener('error', (e) => {
+  toast('오류: ' + (e.message || 'unknown'));
+});

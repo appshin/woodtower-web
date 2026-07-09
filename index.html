@@ -102,7 +102,8 @@
   li .grow { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   li .rank { width:26px; font-weight:700; }
   li input[type=text] { flex:1; padding:9px 10px; }
-  li .stat { font-size:13px; opacity:.75; }
+  li .stat { font-size:12px; opacity:.8; text-align:right; line-height:1.35; flex:none; }
+  li .stat b { font-size:14px; opacity:1; color:var(--amber); }
   li.offline .grow { opacity:.45; }
   .peer { cursor:pointer; background:rgba(0,0,0,.22); border-radius:10px; margin-bottom:6px; padding:12px; border-bottom:0; }
   .roomcode {
@@ -220,8 +221,9 @@
         <div class="stack" style="margin-top:16px">
           <button class="btn-primary hidden" id="btnNextRound">다음 라운드</button>
           <button class="btn-primary hidden" id="btnSeeRank">순위 보기</button>
-          <button class="btn-ghost hidden" id="btnResultHome">홈으로</button>
+          <button class="btn-ghost hidden" id="btnRestart">처음부터 다시하기</button>
           <p class="muted center hidden" id="waitHostText">방장이 다음 라운드를 시작할 때까지 기다려주세요.</p>
+          <button class="btn-ghost" id="btnResultHome">홈으로</button>
         </div>
       </div>
     </div>
