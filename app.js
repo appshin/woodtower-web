@@ -342,11 +342,9 @@ const REJOIN_GRACE_SECONDS = 30;
 let S = null;                       // authoritative GameState (host) / replica (guest)
 let role = 'SOLO';                  // SOLO | HOST | GUEST
 let myIndex = 0;
-let viewAngle = 0;                  // 0 = odd (Z) levels face us, 1 = even (X)
 let reconnecting = false;
 const myPid = store.pid();
 
-const selectableAxis = () => (viewAngle === 0 ? 'Z' : 'X');
 const isOnline = (i) => (S.online ? S.online[i] !== false : true);
 const isMyTurn = () => (role === 'SOLO' ? true : S && S.current === myIndex && !reconnecting);
 const canControlFlow = () => role !== 'GUEST';
@@ -359,7 +357,7 @@ function newGame(players, rounds) {
     phase: 'PLAYING', lastMargin: 1, leanX: 0, leanZ: 0, loser: -1,
     seed: randSeed(), waitingFor: -1, waitSeconds: 0,
   };
-  viewAngle = 0;
+  resetView();
 }
 
 function nextOnlineAfter(from) {
@@ -414,7 +412,7 @@ function nextRound() {
     loser: -1, lastMargin: 1, leanX: 0, leanZ: 0, seed: randSeed(),
     waitingFor: -1, waitSeconds: 0,
   });
-  viewAngle = 0;
+  resetView();
   if (role === 'HOST') net.broadcast(stateMsg());
   $('resultOverlay').classList.add('hidden');
   render(); syncHud();
@@ -433,16 +431,110 @@ function standings() {
 
 const stateMsg = () => ({ t: 'STATE', s: S });
 
-// --------------------------------------------------------------- rendering
+// --------------------------------------------------------- 3D projection
+/*
+ * Orthographic camera. The tower lives in world space with +Y up, and a block
+ * is 3 x 0.6 x 1 units (the real 75 x 15 x 25 mm, scaled). We yaw around Y and
+ * pitch down, so every face stays a parallelogram on screen — which means a
+ * plain 2D affine transform maps the wood texture onto it exactly.
+ */
+const BLOCK_LEN = 3, BLOCK_H = 0.6, BLOCK_W = 1;
+const PITCH_MIN = 0.05, PITCH_MAX = 0.95;
+
+let yaw = 0.55, pitch = 0.30, yawVel = 0;
+let scale = 40, originX = 0, originY = 0;
+
 const canvas = $('tower');
 const ctx2d = canvas.getContext('2d');
 const imgEnd = new Image(); imgEnd.src = 'block_end.png';
 const imgSide = new Image(); imgSide.src = 'block_side.png';
+const imgTop = new Image(); imgTop.src = 'block_top.png';
 
-let cells = [];        // {block, level, x,y,w,h, isEnd, forbidden}
-let levelH = 0;
-let selected = null, dragY = 0, jerk = 0, curTight = 0.5, lastPointerY = 0;
+function resetView() { yaw = 0.55; pitch = 0.30; yawVel = 0; }
+
+/** Small-angle lean of the whole tower about its base, driven by the physics. */
+function leanAngles() {
+  return S ? { a: S.leanX * 0.08, b: S.leanZ * 0.08 } : { a: 0, b: 0 };
+}
+
+function project(p, lean) {
+  let { x, y, z } = p;
+  const ca = Math.cos(lean.a), sa = Math.sin(lean.a);
+  const cb = Math.cos(lean.b), sb = Math.sin(lean.b);
+  let x1 = x * ca + y * sa, y1 = -x * sa + y * ca;       // tilt toward +X
+  let z1 = z * cb + y1 * sb; y1 = -z * sb + y1 * cb;     // tilt toward +Z
+
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const x2 = x1 * cy + z1 * sy;
+  const z2 = -x1 * sy + z1 * cy;
+
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const y3 = y1 * cp - z2 * sp;
+  const z3 = y1 * sp + z2 * cp;                          // depth: bigger = nearer
+
+  return { x: originX + x2 * scale, y: originY - y3 * scale, d: z3 };
+}
+
+/** Same rotations, no translation — for normals and direction vectors. */
+function rotateDir(v) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const x2 = v.x * cy + v.z * sy;
+  const z2 = -v.x * sy + v.z * cy;
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  return { x: x2, y: v.y * cp - z2 * sp, z: v.y * sp + z2 * cp };
+}
+
+// ------------------------------------------------------------------- boxes
+/** Where a block sits, and how it is oriented. */
+function blockGeom(b) {
+  const alongX = axisOf(b.level) === 'X';
+  const off = slotOffset(b.slot);
+  return {
+    alongX,
+    c: alongX ? { x: 0, y: b.level * BLOCK_H + BLOCK_H / 2, z: off * BLOCK_W }
+              : { x: off * BLOCK_W, y: b.level * BLOCK_H + BLOCK_H / 2, z: 0 },
+    h: alongX ? { x: BLOCK_LEN / 2, y: BLOCK_H / 2, z: BLOCK_W / 2 }
+              : { x: BLOCK_W / 2, y: BLOCK_H / 2, z: BLOCK_LEN / 2 },
+  };
+}
+
+/** The axis a block would slide out along. */
+const pullAxis = (g) => (g.alongX ? { x: 1, y: 0, z: 0 } : { x: 0, y: 0, z: 1 });
+
+/**
+ * Faces as [origin, uCorner, vCorner] in local units, plus which texture they
+ * take and their outward normal. The bottom face is never visible, so it is
+ * left out. `swap` flips the top texture 90 degrees for Z-oriented blocks so
+ * the grain always runs along the block.
+ */
+function facesOf(g) {
+  const { x: hx, y: hy, z: hz } = g.h;
+  const side = g.alongX ? imgSide : imgEnd;   // the +-Z pair
+  const flank = g.alongX ? imgEnd : imgSide;  // the +-X pair
+  return [
+    { n: { x: 0, y: 0, z: 1 }, img: side,
+      p: [[-hx, hy, hz], [hx, hy, hz], [-hx, -hy, hz]] },
+    { n: { x: 0, y: 0, z: -1 }, img: side,
+      p: [[hx, hy, -hz], [-hx, hy, -hz], [hx, -hy, -hz]] },
+    { n: { x: 1, y: 0, z: 0 }, img: flank,
+      p: [[hx, hy, hz], [hx, hy, -hz], [hx, -hy, hz]] },
+    { n: { x: -1, y: 0, z: 0 }, img: flank,
+      p: [[-hx, hy, -hz], [-hx, hy, hz], [-hx, -hy, -hz]] },
+    { n: { x: 0, y: 1, z: 0 }, img: imgTop,
+      p: g.alongX ? [[-hx, hy, -hz], [hx, hy, -hz], [-hx, hy, hz]]
+                  : [[-hx, hy, hz], [-hx, hy, -hz], [hx, hy, hz]] },
+  ];
+}
+
+const LIGHT = (() => { const l = { x: -0.42, y: 0.80, z: 0.43 };
+  const m = Math.hypot(l.x, l.y, l.z); return { x: l.x / m, y: l.y / m, z: l.z / m }; })();
+
+// ---------------------------------------------------------------- the frame
+let frame = [];          // per-block picking data, nearest last
 let debris = null, collapseStart = 0;
+let selected = null, pullDist = 0, jerk = 0, curTight = 0.5;
+let pullOutDir = null;   // world unit vector the selected block slides along
+let pullScreen = null;   // that direction, projected, in px per world unit
 
 function fitCanvas() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
@@ -450,162 +542,284 @@ function fitCanvas() {
   canvas.width = Math.round(r.width * dpr);
   canvas.height = Math.round(r.height * dpr);
   ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx2d.imageSmoothingQuality = 'low';
 }
 window.addEventListener('resize', () => { fitCanvas(); layout(); render(); });
 
 function layout() {
-  cells = [];
   if (!S) return;
   const W = canvas.clientWidth, H = canvas.clientHeight;
   if (!W || !H) return;
-  const t = S.tower, top = topLevel(t), levels = top + 1;
-  const marginBottom = H * 0.06;
-
-  let towerW = W * 0.60;
-  levelH = (towerW / 3) * 0.60;                 // real block is 75 x 25 x 15
-  const usable = H - marginBottom - H * 0.10;
-  const needed = levels * levelH;
-  if (needed > usable) { const k = usable / needed; levelH *= k; towerW *= k; }
-
-  const blockW = towerW / 3, cx = W / 2, baseY = H - marginBottom;
-  const forb = forbiddenLevels(t);
-  const sel = selectableAxis();
-
-  for (let l = 0; l <= top; l++) {
-    const bs = levelBlocks(t, l);
-    if (!bs.length) continue;
-    const yTop = baseY - (l + 1) * levelH;
-    if (axisOf(l) === sel) {
-      // Facing us end-on: three separate, grabbable end faces.
-      for (const b of bs) {
-        cells.push({
-          block: b, level: l, x: cx + (b.slot - 1) * blockW - blockW / 2, y: yTop,
-          w: blockW, h: levelH, isEnd: true, forbidden: forb.has(l),
-        });
-      }
-    } else {
-      // Side-on: one long face, nothing to grab from this angle.
-      cells.push({
-        block: null, level: l, x: cx - towerW / 2, y: yTop,
-        w: towerW, h: levelH, isEnd: false, forbidden: forb.has(l),
-      });
-    }
-  }
+  const levels = topLevel(S.tower) + 1;
+  const towerH = levels * BLOCK_H;
+  // The footprint spans 3 units; at 45 degrees its projected width is 3 * sqrt(2).
+  const sByW = (W * 0.86) / (BLOCK_LEN * 1.42);
+  const sByH = (H * 0.86) / (towerH * Math.cos(PITCH_MIN) + BLOCK_LEN * 1.42 * Math.sin(PITCH_MAX));
+  scale = Math.min(sByW, sByH);
+  originX = W / 2;
+  originY = H * 0.90;
 }
 
-function drawCell(c, dy, highlight) {
-  const img = c.isEnd ? imgEnd : imgSide;
-  const y = c.y + (dy || 0);
-  ctx2d.fillStyle = 'rgba(0,0,0,.20)';
-  ctx2d.fillRect(c.x + 3, y + 3, c.w, c.h);
-  if (img.complete) ctx2d.drawImage(img, c.x, y, c.w, c.h);
-  if (c.forbidden && c.block) { ctx2d.fillStyle = 'rgba(40,20,10,.30)'; ctx2d.fillRect(c.x, y, c.w, c.h); }
-  if (highlight) { ctx2d.fillStyle = 'rgba(255,226,168,.28)'; ctx2d.fillRect(c.x, y, c.w, c.h); }
+/** px of screen travel that counts as one full extraction. */
+const pullLimitWorld = () => BLOCK_LEN * 0.62;
+
+function buildFrame() {
+  const lean = leanAngles();
+  frame = [];
+  const quads = [];
+
+  for (const b of S.tower.blocks) {
+    const g = blockGeom(b);
+    let cx = g.c.x, cy = g.c.y, cz = g.c.z;
+    let spin = null;
+
+    if (debris) {
+      const d = debris.get(b.id);
+      if (!d) continue;
+      cx += d.dx; cy += d.dy; cz += d.dz; spin = d;
+    } else if (selected && selected.id === b.id && pullDist > 0) {
+      cx += pullOutDir.x * pullDist; cy += pullOutDir.y * pullDist; cz += pullOutDir.z * pullDist;
+    }
+
+    const isSel = selected && selected.id === b.id;
+    const forb = !debris && forbiddenLevels(S.tower).has(b.level);
+    const polys = [];
+
+    for (const f of facesOf(g)) {
+      let n = f.n;
+      if (spin) n = spinVec(n, spin);
+      const nv = rotateDir(n);
+      if (nv.z <= 0.02) continue;                       // back-facing
+
+      const pts = f.p.map((q) => {
+        let v = { x: q[0], y: q[1], z: q[2] };
+        if (spin) v = spinVec(v, spin);
+        return project({ x: cx + v.x, y: cy + v.y, z: cz + v.z }, lean);
+      });
+      // fourth corner of the parallelogram: p1 + p3 - p0
+      const p4 = { x: pts[1].x + pts[2].x - pts[0].x, y: pts[1].y + pts[2].y - pts[0].y };
+
+      const shade = 0.52 + 0.48 * Math.max(0, n.x * LIGHT.x + n.y * LIGHT.y + n.z * LIGHT.z);
+      const depth = (pts[0].d + pts[1].d + pts[2].d) / 3;
+      const poly = [pts[0], pts[1], p4, pts[2]];
+      polys.push(poly);
+      quads.push({ depth, pts, img: f.img, shade, isSel, forb });
+    }
+    if (!polys.length) continue;
+
+    // Can we actually reach it from here? A block whose axis lies across the
+    // camera shows only its long face — you would have to walk around the table.
+    const ax = pullAxis(g);
+    const va = rotateDir(ax);
+    const towardCam = va.z >= 0 ? 1 : -1;
+    const reach = Math.abs(va.z);
+    const outDir = { x: ax.x * towardCam, y: 0, z: ax.z * towardCam };
+
+    const o = project({ x: cx, y: cy, z: cz }, lean);
+    const o2 = project({ x: cx + outDir.x, y: cy, z: cz + outDir.z }, lean);
+    frame.push({
+      block: b, polys, forb, depth: o.d, reach, outDir,
+      outScreen: { x: o2.x - o.x, y: o2.y - o.y },
+    });
+  }
+
+  quads.sort((a, b) => a.depth - b.depth);
+  return quads;
+}
+
+function spinVec(v, d) {
+  const cx = Math.cos(d.rx), sx = Math.sin(d.rx);
+  const cy = Math.cos(d.ry), sy = Math.sin(d.ry);
+  let y = v.y * cx - v.z * sx, z = v.y * sx + v.z * cx;
+  let x = v.x * cy + z * sy; z = -v.x * sy + z * cy;
+  return { x, y, z };
+}
+
+function drawQuad(q) {
+  const [p0, p1, p3] = q.pts;
+  const img = q.img;
+  if (!img.complete || !img.naturalWidth) return;
+  const w = img.naturalWidth, h = img.naturalHeight;
+  ctx2d.save();
+  ctx2d.transform((p1.x - p0.x) / w, (p1.y - p0.y) / w,
+                  (p3.x - p0.x) / h, (p3.y - p0.y) / h, p0.x, p0.y);
+  ctx2d.drawImage(img, 0, 0, w, h);
+  const dark = 1 - q.shade;
+  if (dark > 0.001) { ctx2d.fillStyle = `rgba(24,14,6,${dark.toFixed(3)})`; ctx2d.fillRect(0, 0, w, h); }
+  if (q.forb) { ctx2d.fillStyle = 'rgba(60,26,12,.34)'; ctx2d.fillRect(0, 0, w, h); }
+  if (q.isSel) { ctx2d.fillStyle = 'rgba(255,214,140,.30)'; ctx2d.fillRect(0, 0, w, h); }
+  ctx2d.restore();
 }
 
 function render() {
   if (!S) return;
   const W = canvas.clientWidth, H = canvas.clientHeight;
   ctx2d.clearRect(0, 0, W, H);
-
-  if (debris) { debris.forEach(drawDebris); return; }
-
-  const lean = viewAngle === 0 ? S.leanX : S.leanZ;
-  const deg = clamp(lean * 4.2, -9, 9);
-  ctx2d.save();
-  ctx2d.translate(W / 2, H * 0.94);
-  ctx2d.rotate((deg * Math.PI) / 180);
-  ctx2d.translate(-W / 2, -H * 0.94);
-  const pullLimit = levelH * 1.8;
-  for (const c of cells) {
-    const isSel = c.block && selected && c.block.id === selected.id;
-    drawCell(c, isSel ? dragY : 0, isSel && dragY >= pullLimit);
-  }
-  ctx2d.restore();
+  const quads = buildFrame();
+  frame.sort((a, b) => a.depth - b.depth);   // picking wants nearest last
+  for (const q of quads) drawQuad(q);
 }
 
-function drawDebris(d) {
-  const img = d.isEnd ? imgEnd : imgSide;
-  ctx2d.save();
-  ctx2d.translate(d.x + d.w / 2, d.y + d.h / 2);
-  ctx2d.rotate((d.rot * Math.PI) / 180);
-  if (img.complete) ctx2d.drawImage(img, -d.w / 2, -d.h / 2, d.w, d.h);
-  ctx2d.restore();
-}
-
+// -------------------------------------------------------------- collapse
 function startCollapse() {
   const rnd = mulberry32(S.seed);
-  const lean = viewAngle === 0 ? S.leanX : S.leanZ;
-  debris = cells.map((c) => ({
-    x: c.x, y: c.y, w: c.w, h: c.h, isEnd: c.isEnd,
-    vx: (rnd() - 0.5) * 900 + lean * 700, vy: -rnd() * 250,
-    rot: 0, vr: (rnd() - 0.5) * 540,
-  }));
+  debris = new Map();
+  for (const b of S.tower.blocks) {
+    debris.set(b.id, {
+      dx: 0, dy: 0, dz: 0, rx: 0, ry: 0,
+      vx: (rnd() - 0.5) * 9 + S.leanX * 7,
+      vy: rnd() * 1.2,
+      vz: (rnd() - 0.5) * 9 + S.leanZ * 7,
+      wx: (rnd() - 0.5) * 9, wy: (rnd() - 0.5) * 9,
+      base: b.level * BLOCK_H,
+    });
+  }
   collapseStart = performance.now();
   feel.collapse(S.seed);
-  requestAnimationFrame(stepCollapse);
 }
 
-function stepCollapse(now) {
-  if (!debris) return;
-  const dt = Math.min(0.033, (now - (stepCollapse.last || now)) / 1000);
-  stepCollapse.last = now;
-  const floorY = canvas.clientHeight * 0.94;
-  for (const d of debris) {
-    d.vy += 2600 * dt;
-    d.x += d.vx * dt; d.y += d.vy * dt; d.rot += d.vr * dt;
-    if (d.y + d.h > floorY) { d.y = floorY - d.h; d.vy = -d.vy * 0.28; d.vx *= 0.62; d.vr *= 0.5; }
+function stepCollapse(dt) {
+  for (const d of debris.values()) {
+    d.vy -= 26 * dt;
+    d.dx += d.vx * dt; d.dy += d.vy * dt; d.dz += d.vz * dt;
+    d.rx += d.wx * dt; d.ry += d.wy * dt;
+    const floor = -d.base;   // centre returns to BLOCK_H/2 above the table
+    if (d.dy < floor) { d.dy = floor; d.vy = -d.vy * 0.26; d.vx *= 0.60; d.vz *= 0.60; d.wx *= 0.5; d.wy *= 0.5; }
+  }
+}
+
+// ----------------------------------------------------------- render loop
+let lastFrameTs = 0;
+function loop(ts) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.033, (ts - lastFrameTs) / 1000 || 0);
+  lastFrameTs = ts;
+  if (!S || !$('gameScreen').classList.contains('on')) return;
+
+  if (debris) {
+    stepCollapse(dt);
+    if (ts - collapseStart > 2100) {
+      // The host decides when the round ends; a guest just keeps the rubble up
+      // until the next STATE arrives, so the tower never pops back together.
+      if (role === 'GUEST') { if (S.phase !== 'COLLAPSING') debris = null; }
+      else { debris = null; onCollapseFinished(); }
+    }
+  } else if (!selected && Math.abs(yawVel) > 0.0004) {
+    yaw += yawVel * dt;                 // flick momentum
+    yawVel *= Math.pow(0.06, dt);
   }
   render();
-  if (now - collapseStart < 1900) requestAnimationFrame(stepCollapse);
-  else { debris = null; stepCollapse.last = 0; render(); onCollapseFinished(); }
 }
+requestAnimationFrame(loop);
 
 // ------------------------------------------------------------------- input
+/*
+ * One finger does two jobs, so we watch the first few pixels to decide:
+ * a mostly-horizontal move orbits the camera, anything else on a reachable
+ * block pulls it. Starting on empty space always orbits.
+ */
+const GESTURE_SLOP = 9;
+let ptr = null;   // {id, x0, y0, lastX, lastY, mode, hit}
+
 function canvasPoint(e) {
   const r = canvas.getBoundingClientRect();
   return { x: e.clientX - r.left, y: e.clientY - r.top };
 }
+
+function pointInPoly(pt, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.y > pt.y) !== (b.y > pt.y) &&
+        pt.x < ((b.x - a.x) * (pt.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+/** Nearest block whose visible silhouette contains the point. */
+function pick(pt) {
+  for (let i = frame.length - 1; i >= 0; i--) {
+    const f = frame[i];
+    if (f.polys.some((p) => pointInPoly(pt, p))) return f;
+  }
+  return null;
+}
+
 const inputEnabled = () => S && S.phase === 'PLAYING' && isMyTurn() && S.waitingFor < 0 && !debris;
+
+/** Screen direction the block travels as it comes out, and px per world unit. */
+function pullVectors(f) {
+  const L = Math.hypot(f.outScreen.x, f.outScreen.y);
+  // Nearly end-on: the block barely moves on screen, so drag downward instead.
+  if (L < 0.30 * scale) return { unit: { x: 0, y: 1 }, pxPerUnit: 0.62 * scale };
+  return { unit: { x: f.outScreen.x / L, y: f.outScreen.y / L }, pxPerUnit: L };
+}
 
 canvas.addEventListener('pointerdown', (e) => {
   sound.unlock();
-  if (!inputEnabled()) return;
+  if (ptr) return;
   const p = canvasPoint(e);
-  const hit = cells.find((c) => c.block && !c.forbidden &&
-    p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h);
-  if (!hit) return;
   canvas.setPointerCapture(e.pointerId);
-  selected = hit.block; dragY = 0; jerk = 0; lastPointerY = e.clientY;
-  curTight = tightnessOf(S.tower, selected);
-  feel.grab(curTight, slipLengthPx(curTight, levelH), e.timeStamp);
-  render();
+  const hit = inputEnabled() ? pick(p) : null;
+  ptr = { id: e.pointerId, x0: p.x, y0: p.y, lastX: p.x, lastY: p.y, ts: e.timeStamp, mode: null, hit };
+  // Nothing grabbable under the finger, or the block is out of reach: orbit.
+  if (!hit || hit.forb || hit.reach < 0.26) ptr.mode = 'orbit';
+  yawVel = 0;
 });
 
 canvas.addEventListener('pointermove', (e) => {
-  if (!selected) return;
-  // movementX/Y is unreliable for touch pointers, so track clientY ourselves.
-  const dy = e.clientY - lastPointerY;
-  lastPointerY = e.clientY;
-  const prev = dragY;
-  dragY = Math.max(0, dragY + dy);
-  jerk = Math.max(jerk, clamp(Math.abs(dy) / 40, 0, 1));
-  feel.slide(dragY - prev, e.timeStamp);
-  render();
+  if (!ptr || e.pointerId !== ptr.id) return;
+  const p = canvasPoint(e);
+  const dx = p.x - ptr.lastX, dy = p.y - ptr.lastY;
+  ptr.lastX = p.x; ptr.lastY = p.y;
+
+  if (!ptr.mode) {
+    const tx = p.x - ptr.x0, ty = p.y - ptr.y0;
+    if (Math.hypot(tx, ty) < GESTURE_SLOP) return;
+    if (Math.abs(tx) > Math.abs(ty) * 1.15) { ptr.mode = 'orbit'; }
+    else {
+      ptr.mode = 'pull';
+      selected = ptr.hit.block;
+      pullOutDir = ptr.hit.outDir;
+      pullScreen = pullVectors(ptr.hit);
+      pullDist = 0; jerk = 0;
+      curTight = tightnessOf(S.tower, selected);
+      feel.grab(curTight, slipLengthPx(curTight, BLOCK_H * scale), e.timeStamp);
+    }
+  }
+
+  if (ptr.mode === 'orbit') {
+    yaw += dx * 0.0072;
+    pitch = clamp(pitch - dy * 0.0045, PITCH_MIN, PITCH_MAX);
+    const dt = Math.max(0.008, (e.timeStamp - ptr.ts) / 1000);
+    yawVel = clamp((dx * 0.0072) / dt, -7, 7);
+    ptr.ts = e.timeStamp;
+    return;
+  }
+
+  if (ptr.mode === 'pull') {
+    const along = (dx * pullScreen.unit.x + dy * pullScreen.unit.y) / pullScreen.pxPerUnit;
+    const before = pullDist;
+    pullDist = Math.max(0, pullDist + along);
+    jerk = Math.max(jerk, clamp(Math.abs(along) * scale / 40, 0, 1));
+    feel.slide((pullDist - before) * pullScreen.pxPerUnit, e.timeStamp);
+  }
 });
 
-function endDrag() {
-  if (!selected) return;
-  const extracted = dragY >= levelH * 1.8;
-  feel.release(extracted);
-  const b = selected;
-  selected = null; dragY = 0;
-  if (extracted) { const before = S.pulls.reduce((a, c) => a + c, 0); pull(b, jerk); afterPull(before); }
-  jerk = 0;
-  render();
+function endPointer(e) {
+  if (!ptr || (e && e.pointerId !== ptr.id)) return;
+  if (ptr.mode === 'pull' && selected) {
+    const extracted = pullDist >= pullLimitWorld();
+    feel.release(extracted);
+    const b = selected;
+    selected = null; pullDist = 0;
+    if (extracted) { const before = S.pulls.reduce((a, c) => a + c, 0); pull(b, jerk); afterPull(before); }
+    jerk = 0;
+  }
+  ptr = null;
 }
-canvas.addEventListener('pointerup', endDrag);
-canvas.addEventListener('pointercancel', endDrag);
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
 
 /** Local echo for the block landing on top; guests get it from the STATE diff. */
 function afterPull(pullsBefore) {
@@ -625,7 +839,7 @@ function syncHud() {
   $('meterText').textContent = `안정도 ${Math.round(m * 100)}%`;
   $('hint').textContent = !isMyTurn()
     ? `${S.players[S.current]} 님의 차례를 기다리는 중…`
-    : `블록을 아래로 끌어당겨 빼세요 · 현재 시점: ${viewAngle === 0 ? '정면' : '측면'}`;
+    : '좌우로 밀면 타워가 돌아갑니다 · 블록을 잡아 바깥으로 당겨 빼세요';
 
   const wb = $('waitBanner');
   if (S.waitingFor >= 0) {
@@ -737,7 +951,7 @@ const net = {
       layout();
       if (S.phase === 'COLLAPSING') startCollapse();
       else if (S.pulls.reduce((a, c) => a + c, 0) > before) feel.placed();
-      render(); syncHud();
+      syncHud();
     }
   },
 
@@ -855,14 +1069,14 @@ const net = {
       const prevPulls = S ? S.pulls.reduce((a, c) => a + c, 0) : 0;
       const prevRound = S ? S.round : 0;
       S = msg.s;
-      if (S.round !== prevRound && S.phase === 'PLAYING') viewAngle = 0;
-      if ($('gameScreen').classList.contains('on')) { layout(); }
+      if (S.round !== prevRound && S.phase === 'PLAYING') resetView();
+      if ($('gameScreen').classList.contains('on')) layout();
       else enterGame();
-      if (S.phase === 'COLLAPSING' && prevPhase !== 'COLLAPSING') { layout(); startCollapse(); }
+      if (S.phase === 'COLLAPSING' && prevPhase !== 'COLLAPSING') startCollapse();
       else if (S.phase === 'PLAYING' && S.pulls.reduce((a, c) => a + c, 0) > prevPulls) feel.placed();
       if (S.phase === 'ROUND_OVER' || S.phase === 'GAME_OVER') showResult();
       else $('resultOverlay').classList.add('hidden');
-      render(); syncHud();
+      syncHud();
       return;
     }
     if (msg.t === 'REJECT') { toast('이미 시작된 게임입니다.'); leaveNet(); return; }
@@ -1000,7 +1214,7 @@ $('btnSkip').onclick = () => skipTurn();
 $('btnNextRound').onclick = () => nextRound();
 $('btnSeeRank').onclick = () => { showRanking(); showScreen('rankScreen'); };
 $('btnResultHome').onclick = () => (role === 'SOLO' ? showScreen('homeScreen') : leaveNet());
-$('btnRotate').onclick = () => { viewAngle = 1 - viewAngle; layout(); render(); syncHud(); };
+$('btnRotate').onclick = () => { resetView(); render(); };
 $('btnSound').onclick = () => { sound.enabled = !sound.enabled; store.setFlag('wt_sound', sound.enabled); if (!sound.enabled) sound.stopFriction(); syncHud(); };
 $('btnHaptic').onclick = () => { haptics.enabled = !haptics.enabled; store.setFlag('wt_haptic', haptics.enabled); syncHud(); };
 $('btnClearRank').onclick = () => { if (confirm('모든 누적 기록을 삭제할까요?')) { store.clear(); showRanking(); } };
