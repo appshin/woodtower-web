@@ -337,6 +337,31 @@ const store = {
 sound.enabled = store.flag('wt_sound', true);
 haptics.enabled = store.flag('wt_haptic', true);
 
+// ------------------------------------------------------------------- modes
+/*
+ * All four modes ride on the same tower, the same stability model and the same
+ * seat/reconnect protocol. Only the turn rules differ.
+ *
+ * Names are deliberately generic: the real-world variants these borrow from
+ * ("Boom", "Throw'n Go", "Quake") are registered trademarks.
+ */
+const MODES = {
+  CLASSIC:  { label: '클래식',    desc: '기본 규칙. 무너뜨리면 실패 1회.' },
+  TIMED:    { label: '타임어택',  desc: '턴마다 제한 시간. 시간이 다 되면 타워가 무너집니다.' },
+  COLOR:    { label: '컬러 룰렛', desc: '매 턴 색이 지정됩니다. 그 색 블록만 뺄 수 있어요.' },
+  SURVIVAL: { label: '서바이벌',  desc: '무너뜨리면 탈락. 마지막 한 명이 우승합니다.' },
+};
+
+const TURN_LIMIT_SECONDS = 20;
+
+const BLOCK_COLORS = [
+  { name: '빨강', css: 'rgba(176,58,46,.46)', chip: '#B03A2E' },
+  { name: '파랑', css: 'rgba(40,102,150,.46)', chip: '#286696' },
+  { name: '노랑', css: 'rgba(196,148,20,.40)', chip: '#C49414' },
+];
+/** Deterministic from the block id, which every device already agrees on. */
+const colorOf = (id) => id % 3;
+
 // ------------------------------------------------------------------- state
 const REJOIN_GRACE_SECONDS = 30;
 
@@ -352,16 +377,23 @@ const canControlFlow = () => role !== 'GUEST';
 
 function clearSelection() { selected = null; pulling = false; pullDist = 0; }
 
-function newGame(players, rounds) {
+function newGame(players, rounds, mode) {
   clearSelection();
+  stopTurnClock();
   S = {
     players, online: players.map(() => true),
+    mode: mode || 'CLASSIC',
     totalRounds: rounds, round: 1, current: 0,
     tower: freshTower(), fails: players.map(() => 0), pulls: players.map(() => 0),
     phase: 'PLAYING', lastMargin: 1, leanX: 0, leanZ: 0, loser: -1,
     seed: randSeed(), waitingFor: -1, waitSeconds: 0,
+    out: players.map(() => false),      // SURVIVAL: eliminated
+    place: players.map(() => 0),        // SURVIVAL: finishing position, 1 = winner
+    dieColor: -1,                       // COLOR: required colour, -1 = free choice
+    turnLimit: TURN_LIMIT_SECONDS, turnSeconds: 0,
   };
   resetView();
+  beginTurn();
 }
 
 /**
@@ -371,10 +403,81 @@ function newGame(players, rounds) {
 const completedRounds = () =>
   !S ? 0 : (S.phase === 'ROUND_OVER' || S.phase === 'GAME_OVER' ? S.round : S.round - 1);
 
+const isAlive = (i) => !(S.out && S.out[i]);
+const aliveCount = () => S.players.reduce((n, _, i) => n + (isAlive(i) ? 1 : 0), 0);
+
 function nextOnlineAfter(from) {
   const n = S.players.length;
-  for (let k = 1; k <= n; k++) { const i = (from + k) % n; if (isOnline(i)) return i; }
+  for (let k = 1; k <= n; k++) {
+    const i = (from + k) % n;
+    if (isOnline(i) && isAlive(i)) return i;
+  }
   return from;
+}
+
+/** Colour-mode restriction, on top of the universal top-two-levels rule. */
+function legalPull(t, b) {
+  if (!canRemove(t, b)) return false;
+  if (S.mode === 'COLOR' && S.dieColor >= 0 && colorOf(b.id) !== S.dieColor) return false;
+  return true;
+}
+
+/** Pick a colour that actually has a legal block behind it, else free choice. */
+function rollColor() {
+  if (S.mode !== 'COLOR') { S.dieColor = -1; return; }
+  const avail = [...new Set(S.tower.blocks.filter((b) => canRemove(S.tower, b)).map((b) => colorOf(b.id)))];
+  S.dieColor = avail.length ? avail[(Math.random() * avail.length) | 0] : -1;
+}
+
+let turnTimer = null;
+function stopTurnClock() { if (turnTimer) clearInterval(turnTimer); turnTimer = null; }
+
+/**
+ * Everything that has to happen when the turn passes to somebody new.
+ * Only the authority runs this; guests receive the result in the next STATE.
+ */
+function beginTurn() {
+  stopTurnClock();
+  clearSelection();
+  if (!S || role === 'GUEST' || S.phase !== 'PLAYING') return;
+  rollColor();
+  if (S.mode === 'TIMED') {
+    S.turnSeconds = S.turnLimit;
+    turnTimer = setInterval(() => {
+      if (!S || S.phase !== 'PLAYING') { stopTurnClock(); return; }
+      if (S.waitingFor >= 0) return;             // paused while somebody reconnects
+      S.turnSeconds -= 1;
+      if (S.turnSeconds <= 0) { stopTurnClock(); timeUp(); return; }
+      if (role === 'HOST') net.broadcast(stateMsg());
+      syncHud();
+    }, 1000);
+  }
+  if (role === 'HOST') net.broadcast(stateMsg());
+  syncHud();
+}
+
+/** TIMED: the clock ran out. The tower comes down on the player who dithered. */
+function timeUp() {
+  if (!S || S.phase !== 'PLAYING') return;
+  registerCollapse(S.current);
+  if (role === 'HOST') net.broadcast(stateMsg());
+  layout();
+  startCollapse();
+  syncHud();
+}
+
+/** Shared by a botched pull and a timeout. */
+function registerCollapse(who) {
+  S.fails[who] += 1;
+  S.phase = 'COLLAPSING';
+  S.loser = who;
+  S.seed = randSeed();
+  S.turnSeconds = 0;
+  stopTurnClock();
+  if (S.mode === 'SURVIVAL') {
+    S.place[who] = aliveCount();   // last one standing ends up with place 1
+    S.out[who] = true;
+  }
 }
 
 function applyPull(block, jerk) {
@@ -384,10 +487,7 @@ function applyPull(block, jerk) {
   S.tower = stacked;
   S.lastMargin = a.margin; S.leanX = a.leanX; S.leanZ = a.leanZ;
   if (collapsed) {
-    S.fails[S.current]++;
-    S.phase = 'COLLAPSING';
-    S.loser = S.current;
-    S.seed = randSeed();
+    registerCollapse(S.current);
   } else {
     S.pulls[S.current]++;
     S.current = nextOnlineAfter(S.current);
@@ -396,22 +496,34 @@ function applyPull(block, jerk) {
 }
 
 function pull(block, jerk) {
-  if (!isMyTurn() || S.phase !== 'PLAYING' || !canRemove(S.tower, block)) return;
+  if (!isMyTurn() || S.phase !== 'PLAYING' || !legalPull(S.tower, block)) return;
   if (role === 'GUEST') {
     // The host is the only authority; we just ask.
     if (net.hostConn && net.hostConn.open) net.hostConn.send({ t: 'PULL', id: block.id, j: jerk });
     return;
   }
-  applyPull(block, jerk);
+  const fell = applyPull(block, jerk);
   if (role === 'HOST') net.broadcast(stateMsg());
   layout();
+  if (!fell) beginTurn();            // new colour, fresh clock
   render();
   syncHud();
 }
 
 function onCollapseFinished() {
   if (role === 'GUEST' || S.phase !== 'COLLAPSING') return;
-  const over = S.round >= S.totalRounds;
+
+  let over;
+  if (S.mode === 'SURVIVAL') {
+    over = aliveCount() <= 1;
+    if (over) {
+      const winner = S.players.findIndex((_, i) => isAlive(i));
+      if (winner >= 0) S.place[winner] = 1;
+    }
+  } else {
+    over = S.round >= S.totalRounds;
+  }
+
   S.phase = over ? 'GAME_OVER' : 'ROUND_OVER';
   if (over) store.merge(S.players, S.fails, S.pulls, S.round);
   if (role === 'HOST') net.broadcast(stateMsg());
@@ -421,7 +533,9 @@ function onCollapseFinished() {
 function nextRound() {
   if (role === 'GUEST') return;
   net.cancelGrace();
-  const starter = S.loser >= 0 && isOnline(S.loser) ? S.loser : nextOnlineAfter(Math.max(0, S.loser));
+  // The player who knocked it down goes first — unless they just got eliminated.
+  const starter = S.loser >= 0 && isOnline(S.loser) && isAlive(S.loser)
+    ? S.loser : nextOnlineAfter(Math.max(0, S.loser));
   Object.assign(S, {
     round: S.round + 1, tower: freshTower(), current: starter, phase: 'PLAYING',
     loser: -1, lastMargin: 1, leanX: 0, leanZ: 0, seed: randSeed(),
@@ -429,9 +543,9 @@ function nextRound() {
   });
   resetView();
   clearSelection();
-  if (role === 'HOST') net.broadcast(stateMsg());
   $('resultOverlay').classList.add('hidden');
   layout();          // the fresh tower is shorter, so the camera scale changes
+  beginTurn();       // rolls the colour and restarts the clock, then broadcasts
   render(); syncHud();
 }
 
@@ -439,13 +553,22 @@ function nextRound() {
 function restartGame() {
   if (role === 'GUEST') return;
   net.cancelGrace();
-  newGame(S.players, S.totalRounds);
+  newGame(S.players, S.totalRounds, S.mode);
   if (role === 'HOST') { net.syncOnline(); net.broadcast(stateMsg()); }
   $('resultOverlay').classList.add('hidden');
   layout(); render(); syncHud();
 }
 
 function standings() {
+  if (S.mode === 'SURVIVAL') {
+    // Eliminated players carry the position they went out in; survivors are 1st.
+    const rows = S.players.map((n, i) => ({
+      n, i, out: !isAlive(i), f: S.fails[i], p: S.pulls[i],
+      place: S.place[i] || 1,
+    }));
+    rows.sort((a, b) => a.place - b.place || b.p - a.p);
+    return rows.map((r) => ({ ...r, w: 0, rank: r.place, survival: true }));
+  }
   // Only the player who knocks the tower over loses that round; everyone else
   // wins it. So wins are just the rounds finished minus your own collapses.
   const done = completedRounds();
@@ -617,7 +740,12 @@ function buildFrame() {
     }
 
     const isSel = selected && selected.id === b.id;
-    const forb = !debris && forbiddenLevels(S.tower).has(b.level);
+    const blockedBy = debris ? null
+      : !canRemove(S.tower, b) ? 'top'
+      : (S.mode === 'COLOR' && S.dieColor >= 0 && colorOf(b.id) !== S.dieColor) ? 'color'
+      : null;
+    const forb = !!blockedBy;
+    const tint = S.mode === 'COLOR' && !debris ? colorOf(b.id) : -1;
     const polys = [];
     const faceDepths = [];
 
@@ -640,7 +768,7 @@ function buildFrame() {
       const poly = [pts[0], pts[1], p4, pts[2]];
       polys.push(poly);
       faceDepths.push(depth);
-      quads.push({ depth, pts, img: f.img, shade, isSel, forb });
+      quads.push({ depth, pts, img: f.img, shade, isSel, blockedBy, tint });
     }
     if (!polys.length) continue;
 
@@ -655,7 +783,7 @@ function buildFrame() {
     const o = project({ x: cx, y: cy, z: cz }, lean);
     const o2 = project({ x: cx + outDir.x, y: cy, z: cz + outDir.z }, lean);
     const entry = {
-      block: b, polys, forb, reach, outDir, isSel,
+      block: b, polys, forb, blockedBy, reach, outDir, isSel,
       outScreen: { x: o2.x - o.x, y: o2.y - o.y },
     };
     frame.push(entry);
@@ -689,7 +817,10 @@ function drawQuad(q) {
   ctx2d.drawImage(img, 0, 0, w, h);
   const dark = 1 - q.shade;
   if (dark > 0.001) { ctx2d.fillStyle = `rgba(24,14,6,${dark.toFixed(3)})`; ctx2d.fillRect(0, 0, w, h); }
-  if (q.forb) { ctx2d.fillStyle = 'rgba(60,26,12,.34)'; ctx2d.fillRect(0, 0, w, h); }
+  if (q.tint >= 0) { ctx2d.fillStyle = BLOCK_COLORS[q.tint].css; ctx2d.fillRect(0, 0, w, h); }
+  // Out of reach because of the top-two-levels rule, or because of the colour die.
+  if (q.blockedBy === 'top') { ctx2d.fillStyle = 'rgba(60,26,12,.34)'; ctx2d.fillRect(0, 0, w, h); }
+  else if (q.blockedBy === 'color') { ctx2d.fillStyle = 'rgba(10,8,6,.46)'; ctx2d.fillRect(0, 0, w, h); }
   if (q.isSel) { ctx2d.fillStyle = 'rgba(255,196,92,.42)'; ctx2d.fillRect(0, 0, w, h); }
   ctx2d.restore();
 }
@@ -834,7 +965,8 @@ function beginPull(f, ts) {
 function handleTap(f) {
   if (!inputEnabled()) return;
   if (!f) { selected = null; syncHud(); return; }
-  if (f.forb) { toast('맨 위 층의 블록은 뺄 수 없습니다.'); return; }
+  if (f.blockedBy === 'top') { toast('맨 위 층의 블록은 뺄 수 없습니다.'); return; }
+  if (f.blockedBy === 'color') { toast(`이번 턴은 ${BLOCK_COLORS[S.dieColor].name} 블록만 뺄 수 있습니다.`); return; }
   selected = f.block;
   if (f.reach < REACH_MIN) toast('화면을 돌려서 이 블록의 끝면이 보이게 하세요.');
   else haptics.grab();
@@ -918,7 +1050,27 @@ function afterPull(pullsBefore) {
 function syncHud() {
   if (!S) return;
   $('turnName').textContent = isMyTurn() && role !== 'SOLO' ? '내 차례!' : `${S.players[S.current]} 차례`;
-  $('roundText').textContent = `${S.round} / ${S.totalRounds} 라운드`;
+
+  const mode = MODES[S.mode] ? S.mode : 'CLASSIC';
+  let sub = mode === 'SURVIVAL'
+    ? `서바이벌 · ${aliveCount()}명 생존`
+    : `${MODES[mode].label} · ${S.round} / ${S.totalRounds} 라운드`;
+  if (mode === 'TIMED' && S.phase === 'PLAYING') sub += ` · ⏱ ${Math.max(0, S.turnSeconds)}초`;
+  $('roundText').textContent = sub;
+
+  const bar = $('modeBar');
+  if (mode === 'COLOR' && S.phase === 'PLAYING' && S.dieColor >= 0) {
+    bar.classList.remove('hidden');
+    bar.innerHTML = `<span class="swatch" style="background:${BLOCK_COLORS[S.dieColor].chip}"></span>` +
+      `이번 턴은 <b>${BLOCK_COLORS[S.dieColor].name}</b> 블록만 뺄 수 있습니다`;
+  } else if (mode === 'TIMED' && S.phase === 'PLAYING') {
+    bar.classList.remove('hidden');
+    const left = Math.max(0, S.turnSeconds);
+    const pct = clamp(left / S.turnLimit, 0, 1) * 100;
+    const col = left <= 5 ? 'var(--danger)' : left <= 10 ? 'var(--amber)' : 'var(--safe)';
+    bar.innerHTML = `<div class="clockbar"><div style="width:${pct}%;background:${col}"></div></div>` +
+      `<span class="clocknum" style="color:${col}">${left}</span>`;
+  } else bar.classList.add('hidden');
   const m = clamp(S.lastMargin, 0, 1);
   $('meter').style.width = `${m * 100}%`;
   $('meter').style.background = m > 0.5 ? 'var(--safe)' : m > 0.25 ? 'var(--amber)' : 'var(--danger)';
@@ -942,14 +1094,18 @@ function syncHud() {
 
 function showResult() {
   const over = S.phase === 'GAME_OVER';
-  $('resultTitle').textContent = over ? '게임 종료' : '라운드 종료';
-  $('resultWho').textContent = S.loser >= 0 ? `${S.players[S.loser]} 님이 무너뜨렸습니다` : '';
+  const surv = S.mode === 'SURVIVAL';
+  $('resultTitle').textContent = over ? '게임 종료' : (surv ? '탈락!' : '라운드 종료');
+  $('resultWho').textContent = S.loser >= 0
+    ? (surv ? `${S.players[S.loser]} 님 탈락` : `${S.players[S.loser]} 님이 무너뜨렸습니다`)
+    : '';
   $('standings').innerHTML = standings().map((r) => `
-    <li class="${isOnline(r.i) ? '' : 'offline'}">
+    <li class="${isOnline(r.i) && !r.out ? '' : 'offline'}">
       <span class="rank">${r.rank}</span>
-      <span class="grow">${escapeHtml(r.n)}${isOnline(r.i) ? '' : ' (접속 끊김)'}</span>
-      <span class="stat"><b>${r.w}승 ${r.f}패</b><br>뽑기 ${r.p}</span>
+      <span class="grow">${escapeHtml(r.n)}${isOnline(r.i) ? '' : ' (접속 끊김)'}${r.out ? ' (탈락)' : ''}</span>
+      <span class="stat">${surv ? `<b>${r.rank}위</b>` : `<b>${r.w}승 ${r.f}패</b>`}<br>뽑기 ${r.p}</span>
     </li>`).join('');
+  $('btnNextRound').textContent = surv ? '계속하기' : '다음 라운드';
   $('btnNextRound').classList.toggle('hidden', over || !canControlFlow());
   $('waitHostText').classList.toggle('hidden', over || canControlFlow());
   $('btnSeeRank').classList.toggle('hidden', !over);
@@ -982,7 +1138,7 @@ const net = {
   peer: null,
   hostConn: null, hostCode: '',
   seats: [],                      // [{pid, name, conn, connected}]
-  gameStarted: false, rounds: 3, myName: '',
+  gameStarted: false, rounds: 3, mode: 'CLASSIC', myName: '',
   graceTimer: null, retryTimer: null,
 
   /*
@@ -1000,10 +1156,10 @@ const net = {
   },
 
   // ---- host ----------------------------------------------------------
-  host(name, rounds) {
+  host(name, rounds, mode) {
     if (!this.available()) return;
     const g = ++this.gen;
-    role = 'HOST'; myIndex = 0; this.myName = name; this.rounds = rounds;
+    role = 'HOST'; myIndex = 0; this.myName = name; this.rounds = rounds; this.mode = mode || 'CLASSIC';
     this.gameStarted = false;
     this.seats = [{ pid: myPid, name, conn: null, connected: true }];
     this._openHostPeer(0, g);
@@ -1049,13 +1205,13 @@ const net = {
       const i = this.seats.findIndex((s) => s.conn === conn);
       if (i !== S.current || S.phase !== 'PLAYING') return;
       const b = S.tower.blocks.find((x) => x.id === msg.id);
-      if (!b) return;
+      if (!b || !legalPull(S.tower, b)) return;   // never trust a guest's legality check
       const before = S.pulls.reduce((a, c) => a + c, 0);
       applyPull(b, msg.j);
       this.broadcast(stateMsg());
       layout();
       if (S.phase === 'COLLAPSING') startCollapse();
-      else if (S.pulls.reduce((a, c) => a + c, 0) > before) feel.placed();
+      else { if (S.pulls.reduce((a, c) => a + c, 0) > before) feel.placed(); beginTurn(); }
       syncHud();
     }
   },
@@ -1103,7 +1259,7 @@ const net = {
   startNetGame() {
     if (this.seats.length < 2) { netError('최소 2명이 필요합니다.'); return; }
     this.gameStarted = true;
-    newGame(this.seats.map((s) => s.name), this.rounds);
+    newGame(this.seats.map((s) => s.name), this.rounds, this.mode);
     this.syncOnline();
     this.broadcast(stateMsg());
     enterGame();
@@ -1188,6 +1344,7 @@ const net = {
       const prevRound = S ? S.round : 0;
       S = msg.s;
       if (S.round !== prevRound && S.phase === 'PLAYING') resetView();
+      clearSelection();
       if ($('gameScreen').classList.contains('on')) layout();
       else enterGame();
       if (S.phase === 'COLLAPSING' && prevPhase !== 'COLLAPSING') startCollapse();
@@ -1233,11 +1390,12 @@ function skipTurn() {
   if (role === 'GUEST') return;
   net.cancelGrace();
   S.current = nextOnlineAfter(S.current);
-  if (role === 'HOST') net.broadcast(stateMsg());
+  beginTurn();
   syncHud();
 }
 
 function leaveNet() {
+  stopTurnClock();
   net.shutdown();
   role = 'SOLO'; reconnecting = false; S = null; myIndex = 0;
   showScreen('homeScreen');
@@ -1308,6 +1466,28 @@ function makeRoundsPicker(key, initial) {
   return { get: () => value };
 }
 
+function makeModePicker(key, initial) {
+  const root = document.querySelector(`[data-mode="${key}"]`);
+  const chipsEl = root.querySelector('[data-chips]');
+  const descEl = root.querySelector('[data-desc]');
+  let value = initial;
+
+  chipsEl.innerHTML = Object.entries(MODES)
+    .map(([k, m]) => `<button class="chip" data-k="${k}">${m.label}</button>`).join('');
+
+  const paint = () => {
+    chipsEl.querySelectorAll('.chip').forEach((c) => c.classList.toggle('on', c.dataset.k === value));
+    descEl.textContent = MODES[value].desc;
+    // Survival runs until one player is left, so a round count is meaningless.
+    const roundsCard = document.querySelector(`[data-rounds="${key}"]`);
+    if (roundsCard) roundsCard.classList.toggle('disabled', value === 'SURVIVAL');
+  };
+  chipsEl.querySelectorAll('.chip').forEach((c) =>
+    (c.onclick = () => { value = c.dataset.k; paint(); haptics.grab(); }));
+  paint();
+  return { get: () => value };
+}
+
 // ------------------------------------------------------------ hot-seat UI
 let localPlayers = ['Player 1', 'Player 2'];
 
@@ -1345,19 +1525,21 @@ document.querySelectorAll('[data-exit]').forEach((b) => (b.onclick = () => (role
 
 const roundsLocal = makeRoundsPicker('local', 3);
 const roundsNet = makeRoundsPicker('net', 3);
+const modeLocal = makeModePicker('local', 'CLASSIC');
+const modeNet = makeModePicker('net', 'CLASSIC');
 $('btnAddPlayer').onclick = () => { localPlayers.push(`Player ${localPlayers.length + 1}`); renderPlayers(); };
 
 $('btnStartLocal').onclick = () => {
   if (!validateSetup()) return;
   role = 'SOLO'; myIndex = 0;
-  newGame(localPlayers.map((n) => n.trim()), roundsLocal.get());
+  newGame(localPlayers.map((n) => n.trim()), roundsLocal.get(), modeLocal.get());
   enterGame();
 };
 
 $('btnHost').onclick = () => {
   const n = $('nick').value.trim();
   if (!n) return netError('닉네임을 입력해주세요.');
-  net.host(n, roundsNet.get());
+  net.host(n, roundsNet.get(), modeNet.get());
 };
 $('btnJoin').onclick = () => {
   const n = $('nick').value.trim();
@@ -1387,7 +1569,7 @@ function showRanking() {
   $('sessionLabel').classList.toggle('hidden', !hasSession);
   $('sessionRank').innerHTML = hasSession ? standings().map((r) => `
     <li><span class="rank">${r.rank}</span><span class="grow">${escapeHtml(r.n)}</span>
-    <span class="stat"><b>${r.w}승 ${r.f}패</b><br>뽑기 ${r.p}</span></li>`).join('') : '';
+    <span class="stat">${r.survival ? `<b>${r.rank}위</b>` : `<b>${r.w}승 ${r.f}패</b>`}<br>뽑기 ${r.p}</span></li>`).join('') : '';
 
   // Records saved before wins existed have no `r`; show them as 0승 rather than lying.
   const rows = store.stats()
